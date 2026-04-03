@@ -1,0 +1,231 @@
+name: "CodeQL Analysis"
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  workflow_dispatch: {}
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    
+    # Evita rodar quando o commit é apenas a adição do workflow do SonarCloud
+    if: ${{ !contains(github.event.head_commit.message, 'Add SonarCloud workflow') }}
+    
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: 'javascript-typescript'
+            build-mode: 'none'
+            
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # =========================================================================
+    # SETUP JAVA (para projetos Java/Kotlin)
+    # =========================================================================
+    - name: Setup Java for CodeQL
+      if: matrix.language == 'java-kotlin' || matrix.language == 'java' || matrix.language == 'kotlin'
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '21'
+
+    # =========================================================================
+    # INICIALIZAÇÃO DO CODEQL
+    # =========================================================================
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: ${{ matrix.language }}
+        build-mode: ${{ matrix.build-mode }}
+    
+    # =========================================================================
+    # BUILD JAVA/KOTLIN COM DEGRADAÇÃO GRACIOSA
+    # =========================================================================
+    - name: Build Java/Kotlin (Graceful Degradation)
+      if: matrix.language == 'java-kotlin' || matrix.language == 'java' || matrix.language == 'kotlin'
+      id: java_build
+      continue-on-error: true
+      run: |
+        echo "🔍 Iniciando detecção de build system..."
+        BUILD_SUCCESS="false"
+        
+        # =====================================================================
+        # CORREÇÃO UNIVERSAL: Criar google-services.json falso para Firebase
+        # Usando base64 para evitar problemas de escape YAML
+        # =====================================================================
+        echo "📱 Verificando necessidade de google-services.json..."
+        
+        if grep -rq "com.google.gms.google-services" . 2>/dev/null || grep -rq "google-services" . 2>/dev/null; then
+          echo "🔥 Projeto usa Firebase/Google Services"
+          
+          for app_dir in $(find . -type d -name "app"); do
+            if [ ! -f "$app_dir/google-services.json" ]; then
+              echo "📝 Criando google-services.json dummy em: $app_dir"
+              echo "ewogICJwcm9qZWN0X2luZm8iOiB7CiAgICAicHJvamVjdF9udW1iZXIiOiAiMDAwMDAwMDAwMDAwIiwKICAgICJwcm9qZWN0X2lkIjogImR1bW15LXByb2plY3QtZm9yLWNpIiwKICAgICJzdG9yYWdlX2J1Y2tldCI6ICJkdW1teS1wcm9qZWN0LWZvci1jaS5hcHBzcG90LmNvbSIKICB9LAogICJjbGllbnQiOiBbCiAgICB7CiAgICAgICJjbGllbnRfaW5mbyI6IHsKICAgICAgICAibW9iaWxlc2RrX2FwcF9pZCI6ICIxOjAwMDAwMDAwMDAwMDphbmRyb2lkOjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiLAogICAgICAgICJhbmRyb2lkX2NsaWVudF9pbmZvIjogewogICAgICAgICAgInBhY2thZ2VfbmFtZSI6ICJjb20uZXhhbXBsZS5hcHAiCiAgICAgICAgfQogICAgICB9LAogICAgICAiYXBpX2tleSI6IFsKICAgICAgICB7CiAgICAgICAgICAiY3VycmVudF9rZXkiOiAiQUl6YVN5RHVtbXlLZXlGb3JDSUJ1aWxkT25seTAwMDAwMDAwMCIKICAgICAgICB9CiAgICAgIF0KICAgIH0KICBdLAogICJjb25maWd1cmF0aW9uX3ZlcnNpb24iOiAiMSIKfQo=" | base64 -d > "$app_dir/google-services.json"
+            fi
+          done
+        fi
+        
+        # =====================================================================
+        # 1. MAVEN
+        # =====================================================================
+        POM_PATH=$(find . -maxdepth 3 -name "pom.xml" -type f | head -n 1)
+        if [ -n "$POM_PATH" ]; then
+          echo "✅ Maven Project encontrado em: $POM_PATH"
+          if mvn clean compile -DskipTests -Dmaven.test.skip=true -f "$POM_PATH" --batch-mode; then
+             echo "✅ Build Maven concluído com sucesso."
+             BUILD_SUCCESS="true"
+          else
+             echo "⚠️ Build Maven falhou."
+          fi
+          echo "build_success=$BUILD_SUCCESS" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # =====================================================================
+        # 2. GRADLE (com detecção dinâmica de versão)
+        # =====================================================================
+        GRADLE_FILE=$(find . -maxdepth 3 \( -name "build.gradle" -o -name "build.gradle.kts" \) -type f | head -n 1)
+
+        if [ -n "$GRADLE_FILE" ]; then
+           echo "✅ Gradle File encontrado em: $GRADLE_FILE"
+           BUILD_DIR=$(dirname "$GRADLE_FILE")
+           
+           PROPS=$(find . -name "gradle-wrapper.properties" -type f | head -n 1)
+           TARGET_VER="8.10.2"
+           
+           if [ -f "$PROPS" ]; then
+             echo "📄 Properties encontrado: $PROPS"
+             ver=$(grep -oE 'gradle-[0-9.]+(-(bin|all))?\.zip' "$PROPS" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)
+             if [ -n "$ver" ]; then 
+               TARGET_VER="$ver"
+               echo "✅ Versão detectada no projeto: $TARGET_VER"
+             else
+               echo "⚠️ Não foi possível extrair versão, usando fallback: $TARGET_VER"
+             fi
+           else
+             echo "⚠️ gradle-wrapper.properties não encontrado, usando fallback: $TARGET_VER"
+           fi
+           
+           echo "⬇️ Baixando Gradle $TARGET_VER..."
+           wget -q "https://services.gradle.org/distributions/gradle-${TARGET_VER}-bin.zip" || {
+             echo "❌ Falha ao baixar Gradle $TARGET_VER"
+             echo "build_success=false" >> $GITHUB_OUTPUT
+             exit 0
+           }
+           unzip -q "gradle-${TARGET_VER}-bin.zip"
+           export PATH="$PWD/gradle-${TARGET_VER}/bin:$PATH"
+           echo "✅ Gradle $TARGET_VER instalado"
+           
+           cd "$BUILD_DIR"
+           
+           echo "🚀 Tentando compilar..."
+           
+           if gradle compileDebugSources -x test -x lint --no-daemon 2>/dev/null; then
+              echo "✅ Build (compileDebugSources) concluído com sucesso."
+              BUILD_SUCCESS="true"
+           elif gradle compileKotlin -x test --no-daemon 2>/dev/null; then
+              echo "✅ Build (compileKotlin) concluído com sucesso."
+              BUILD_SUCCESS="true"
+           elif gradle compileJava -x test --no-daemon 2>/dev/null; then
+              echo "✅ Build (compileJava) concluído com sucesso."
+              BUILD_SUCCESS="true"
+           elif gradle classes -x test --no-daemon 2>/dev/null; then
+              echo "✅ Build (classes) concluído com sucesso."
+              BUILD_SUCCESS="true"
+           else
+              echo "⚠️ Todas as estratégias de build falharam."
+           fi
+           
+           echo "build_success=$BUILD_SUCCESS" >> $GITHUB_OUTPUT
+           exit 0
+        fi
+
+        echo "⚠️ Nenhum build system Java reconhecido. CodeQL fará análise source-only."
+        echo "build_success=true" >> $GITHUB_OUTPUT
+        exit 0
+
+    # =========================================================================
+    # VERIFICAÇÃO DO RESULTADO DO BUILD
+    # =========================================================================
+    - name: Check Build Result
+      if: matrix.language == 'java-kotlin' || matrix.language == 'java' || matrix.language == 'kotlin'
+      id: build_check
+      run: |
+        if [ "${{ steps.java_build.outputs.build_success }}" == "true" ]; then
+          echo "✅ Build bem-sucedido. CodeQL Analysis será executada."
+          echo "should_analyze=true" >> $GITHUB_OUTPUT
+        else
+          echo "⚠️ Build falhou ou não foi possível compilar."
+          echo "⚠️ CodeQL Analysis será PULADA para este projeto."
+          echo "should_analyze=false" >> $GITHUB_OUTPUT
+        fi
+
+    # =========================================================================
+    # BUILD C/C++
+    # =========================================================================
+    - name: Build CPP
+      if: matrix.language == 'cpp' && matrix.build-mode == 'manual'
+      continue-on-error: true
+      run: |
+        sudo apt-get update && sudo apt-get install -y build-essential
+        if [ -f "Makefile" ] || [ -f "CMakeLists.txt" ]; then
+           make -k || (cmake . && make -k) || true
+        fi
+        find . -name "*.cpp" -print0 | xargs -0 -I {} bash -c 'g++ -c "{}" || true'
+        find . -name "*.c" -print0 | xargs -0 -I {} bash -c 'gcc -c "{}" || true'
+
+    # =========================================================================
+    # AUTOBUILD (para linguagens que não são Java/Kotlin/C++)
+    # =========================================================================
+    - name: Autobuild (Non-Java/CPP)
+      if: matrix.language != 'java-kotlin' && matrix.language != 'java' && matrix.language != 'kotlin' && matrix.language != 'cpp'
+      uses: github/codeql-action/autobuild@v3
+    
+    # =========================================================================
+    # ANÁLISE CODEQL (CONDICIONAL)
+    # =========================================================================
+    - name: Perform CodeQL Analysis
+      if: |
+        always() && 
+        (
+          (matrix.language != 'java-kotlin' && matrix.language != 'java' && matrix.language != 'kotlin') ||
+          (steps.build_check.outputs.should_analyze == 'true')
+        )
+      uses: github/codeql-action/analyze@v3
+      with:
+        category: "/language:${{ matrix.language }}"
+    
+    # =========================================================================
+    # MENSAGEM FINAL (quando análise foi pulada)
+    # =========================================================================
+    - name: Report Skipped Analysis
+      if: |
+        always() && 
+        (matrix.language == 'java-kotlin' || matrix.language == 'java' || matrix.language == 'kotlin') &&
+        steps.build_check.outputs.should_analyze == 'false'
+      run: |
+        echo "============================================================"
+        echo "⚠️  ANÁLISE CODEQL PULADA"
+        echo "============================================================"
+        echo ""
+        echo "O build do projeto falhou, impossibilitando a análise do CodeQL."
+        echo "Isso geralmente ocorre por:"
+        echo "  - Dependências externas não disponíveis (JitPack, Maven, etc.)"
+        echo "  - Configurações ausentes (google-services.json, etc.)"
+        echo "  - Erros de compilação no código fonte"
+        echo ""
+        echo "A análise do SonarCloud ainda pode ter sido executada com sucesso,"
+        echo "fornecendo métricas de qualidade de código."
+        echo "============================================================"
